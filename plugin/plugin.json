@@ -1,0 +1,11 @@
+{
+  "name": "ae-control",
+  "displayName": "After Effects & GUI Control",
+  "version": "0.3.0",
+  "description": "Inspect Adobe After Effects 2020 projects read-only, generate safe ES3 .jsx ExtendScript files for manual execution, clean up temporary screenshots/artifacts, and render via aerender.",
+  "suggestedPrompts": [
+    "Inspect the active Adobe After Effects project and analyze its current frame layout",
+    "Write a safe ES3 .jsx script for After Effects 2020 to animate this scene without modifying or saving my .aep project",
+    "Clean up old screenshots, frame previews, and temporary files while keeping all .jsx scripts"
+  ]
+}

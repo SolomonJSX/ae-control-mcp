@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ae-control-mcp": {
+      "command": "<REPO_ROOT>\\.venv\\Scripts\\ae-control-mcp.exe",
+      "args": [],
+      "env": {
+        "AE_EXE_PATH": "C:\\Program Files\\Adobe\\Adobe After Effects 2020\\Support Files\\AfterFX.exe",
+        "AE_RENDER_PATH": "C:\\Program Files\\Adobe\\Adobe After Effects 2020\\Support Files\\aerender.exe"
+      }
+    }
+  }
+}
