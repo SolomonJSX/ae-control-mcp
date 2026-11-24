@@ -25,11 +25,16 @@ class TestServerRegistration(unittest.TestCase):
             "keyboard_type",
             "keyboard_hotkey",
             "ae_get_project_info",
+            "ae_inspect_composition",
+            "ae_audit_project",
             "ae_write_script",
             "ae_cleanup_artifacts",
             "ae_render_frame_preview",
+            "ae_render_annotated_preview",
+            "ae_render_contact_sheet",
             "ae_render",
             "ae_analyze_layout",
+            "ae_analyze_motion",
             "analyze_geometry_layout",
         }
         self.assertTrue(expected.issubset(names), f"Missing tools: {expected - names}")

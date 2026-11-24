@@ -7,13 +7,12 @@ from typing import Literal
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from . import after_effects, gui
+from . import after_effects, gui, visuals
 from .ae_geometry import AfterEffectsGeometryProvider, parse_composition_geometry
-from .geometry import CompositeLayoutAnalyzer
+from .geometry import LayoutPreset, analyze_motion_sequence, build_analyzer_for_preset
 
 mcp = FastMCP("ae-control-mcp")
 _ae_geometry_provider = AfterEffectsGeometryProvider(after_effects.AfterEffectsScriptRunner())
-_layout_analyzer = CompositeLayoutAnalyzer()
 
 
 @mcp.tool()
@@ -139,9 +138,10 @@ def mouse_scroll(
     clicks: int,
     x: int | None = None,
     y: int | None = None,
+    target_window: str | None = None,
 ) -> dict[str, int | bool]:
-    """Scroll vertically (positive = up, negative = down)."""
-    gui.scroll_mouse(clicks=clicks, x=x, y=y)
+    """Scroll vertically (positive = up, negative = down), optionally guarded by target_window."""
+    gui.scroll_mouse(clicks=clicks, x=x, y=y, target_window=target_window)
     return {"ok": True, "clicks": clicks}
 
 
@@ -153,9 +153,15 @@ def keyboard_type(text: str, interval: float = 0.01) -> dict[str, bool]:
 
 
 @mcp.tool()
-def keyboard_hotkey(keys: list[str]) -> dict[str, object]:
-    """Press a key or hotkey combination, e.g. ['ctrl', 's'] or ['space']."""
-    gui.press_hotkey(keys=keys)
+def keyboard_hotkey(
+    keys: list[str],
+    target_window: str | None = None,
+) -> dict[str, object]:
+    """Press a key or hotkey combination (e.g. ['space'] or ['ctrl', 'z']).
+
+    Blocks project-saving/closing shortcuts (Ctrl+S, Ctrl+W, Ctrl+Q, Alt+F4) in After Effects.
+    """
+    gui.press_hotkey(keys=keys, target_window=target_window)
     return {"ok": True, "keys": keys}
 
 
@@ -166,23 +172,52 @@ def ae_get_project_info(timeout_seconds: float = 15.0) -> dict[str, object]:
 
 
 @mcp.tool()
+def ae_inspect_composition(
+    comp_name: str | None = None,
+    layer_index: int | None = None,
+    layer_name: str | None = None,
+    time_seconds: float | None = None,
+    timeout_seconds: float = 15.0,
+) -> dict[str, object]:
+    """Read-only deep inspection of composition markers, layer transforms, text styles, effects, and keyframes."""
+    return after_effects.inspect_composition(
+        comp_name=comp_name,
+        layer_index=layer_index,
+        layer_name=layer_name,
+        time_seconds=time_seconds,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+@mcp.tool()
+def ae_audit_project(timeout_seconds: float = 20.0) -> dict[str, object]:
+    """Read-only health audit: detect missing footage, broken expressions, fonts used, unused items, and render templates."""
+    return after_effects.audit_project(timeout_seconds=timeout_seconds)
+
+
+@mcp.tool()
 def ae_write_script(
     output_path: str,
     script_code: str,
     undo_group_name: str | None = None,
     overwrite: bool = True,
+    include_stdlib: bool = False,
+    strict: bool = False,
 ) -> dict[str, object]:
     """Write an ES3 ExtendScript (.jsx) file to disk for the user to run manually in After Effects.
 
-    Does NOT execute the script in After Effects and does NOT save or modify the .aep project.
-    Writes UTF-8 with BOM (for Cyrillic support in AE 2020) and checks for ES6+ syntax warnings.
-    Pass undo_group_name to automatically wrap the script in app.beginUndoGroup/try/catch/finally.
+    - Writes UTF-8 with BOM (for Cyrillic support in AE 2020) and runs the lexical ES3 + safety linter.
+    - Pass undo_group_name to automatically wrap the script in app.beginUndoGroup/try/catch/finally.
+    - Pass include_stdlib=True to inject AEH helpers (AEH.findComp, AEH.hexToRgb, AEH.centerAnchor, AEH.easyEase, AEH.addText).
+    - Pass strict=True to block writing if any ES6+/save() lint errors are detected.
     """
     return after_effects.write_extendscript_file(
         output_path=output_path,
         script_code=script_code,
         undo_group_name=undo_group_name,
         overwrite=overwrite,
+        include_stdlib=include_stdlib,
+        strict=strict,
     )
 
 
@@ -194,13 +229,7 @@ def ae_cleanup_artifacts(
     recursive: bool = False,
     dry_run: bool = False,
 ) -> dict[str, object]:
-    """Clean up old screenshots, preview frames, and temporary junk files while keeping all .jsx scripts.
-
-    - clean_temp=True removes leftover ae_mcp_*/ae_frame_* folders from the system temp directory.
-    - target_dir scans a folder for temporary screenshot/preview images and junk (.tmp/.bak/.log).
-    - extra_paths deletes specific temporary files/folders passed explicitly.
-    - Protected files (.jsx, .jsxbin, .aep, .aepx, .prproj, .psd, .ai, .ffx) are NEVER deleted.
-    """
+    """Clean up old screenshots, preview frames, and temporary junk files while keeping all .jsx scripts."""
     return after_effects.cleanup_artifacts(
         target_dir=target_dir,
         extra_paths=extra_paths,
@@ -217,11 +246,7 @@ def ae_render_frame_preview(
     max_dimension: int = 1280,
     timeout_seconds: float = 30.0,
 ) -> list[object]:
-    """Render an exact composition frame directly from After Effects for visual inspection.
-
-    Uses comp.saveFrameToPng without stealing window focus or capturing AE UI chrome.
-    Returns [Image, metadata_json].
-    """
+    """Render an exact composition frame directly from After Effects for visual inspection."""
     preview = after_effects.save_frame_preview(
         comp_name=comp_name,
         time_seconds=time_seconds,
@@ -238,6 +263,82 @@ def ae_render_frame_preview(
         }
     )
     return [Image(data=preview.image_bytes, format="jpeg"), meta]
+
+
+@mcp.tool()
+def ae_render_annotated_preview(
+    comp_name: str | None = None,
+    time_seconds: float | None = None,
+    preset: LayoutPreset = "standard",
+    check_contrast: bool = True,
+    max_dimension: int = 1280,
+    timeout_seconds: float = 30.0,
+) -> list[object]:
+    """Render a composition frame and overlay safe-zone guides, layer bounding boxes, and layout/contrast warnings."""
+    rgb, _meta = after_effects.render_raw_frame(
+        comp_name=comp_name,
+        time_seconds=time_seconds,
+        timeout_seconds=timeout_seconds,
+    )
+    comp = _ae_geometry_provider.get_composition_geometry(
+        comp_name=comp_name,
+        time_seconds=time_seconds,
+    )
+    analyzer = build_analyzer_for_preset(
+        preset=preset,
+        frame_image=rgb if check_contrast else None,
+        is_vertical_comp=comp.is_vertical,
+    )
+    report = analyzer.analyze(comp)
+    include_social = preset == "social_vertical" or (preset == "full" and comp.is_vertical)
+    img_bytes, out_w, out_h = visuals.annotate_layout_frame(
+        frame_image=rgb,
+        comp=comp,
+        report=report,
+        include_social_zones=include_social,
+        max_dimension=max_dimension,
+    )
+    payload = report.to_dict()
+    payload["annotated_width"] = out_w
+    payload["annotated_height"] = out_h
+    return [Image(data=img_bytes, format="jpeg"), json.dumps(payload)]
+
+
+@mcp.tool()
+def ae_render_contact_sheet(
+    comp_name: str | None = None,
+    timestamps: list[float] | None = None,
+    num_frames: int = 6,
+    columns: int = 3,
+    cell_max_dimension: int = 480,
+    timeout_seconds: float = 45.0,
+) -> list[object]:
+    """Render multiple frames across a composition's work area into a labeled storyboard grid."""
+    frames, meta = after_effects.render_multiple_frames(
+        comp_name=comp_name,
+        timestamps=timestamps,
+        num_frames=num_frames,
+        timeout_seconds=timeout_seconds,
+    )
+    resolved_name = str(meta.get("compName") or comp_name or "Composition")
+    fps = float(meta.get("frameRate") or 30.0)
+    sheet_bytes, width, height = visuals.compose_contact_sheet(
+        frames=frames,
+        comp_name=resolved_name,
+        frame_rate=fps,
+        columns=columns,
+        cell_max_dimension=cell_max_dimension,
+    )
+    info = json.dumps(
+        {
+            "comp_name": resolved_name,
+            "frame_rate": fps,
+            "sampled_times": [round(ts, 3) for ts, _ in frames],
+            "sheet_width": width,
+            "sheet_height": height,
+        }
+    )
+    return [Image(data=sheet_bytes, format="jpeg"), info]
 
 
 @mcp.tool()
@@ -270,16 +371,39 @@ def ae_render(
 def ae_analyze_layout(
     comp_name: str | None = None,
     time_seconds: float | None = None,
+    preset: LayoutPreset = "standard",
 ) -> dict[str, object]:
-    """Extract composition & layer geometry from After Effects 2020 and evaluate layout rules.
+    """Extract parent-aware composition & layer geometry from AE 2020 and evaluate spatial layout rules.
 
-    Detects out-of-frame layers, clipped edges, text outside title-safe margins, and overlaps.
+    Presets:
+    - 'standard': bounds_check + safe_zone (10% title-safe) + overlap_check
+    - 'social_vertical': standard + social_safe_zone (9:16 Reels/TikTok/Shorts UI dead-zones)
+    - 'full': all rules including alignment_consistency (and social_safe_zone on vertical comps)
     """
     comp = _ae_geometry_provider.get_composition_geometry(
         comp_name=comp_name,
         time_seconds=time_seconds,
     )
-    return _layout_analyzer.analyze(comp).to_dict()
+    analyzer = build_analyzer_for_preset(preset=preset, is_vertical_comp=comp.is_vertical)
+    return analyzer.analyze(comp).to_dict()
+
+
+@mcp.tool()
+def ae_analyze_motion(
+    comp_name: str | None = None,
+    timestamps: list[float] | None = None,
+    sample_count: int = 6,
+    preset: LayoutPreset = "standard",
+    timeout_seconds: float = 20.0,
+) -> dict[str, object]:
+    """Sample composition geometry across multiple timestamps in one AE call and detect layout issues over time."""
+    samples = _ae_geometry_provider.get_motion_geometry(
+        comp_name=comp_name,
+        timestamps=timestamps,
+        sample_count=sample_count,
+        timeout_seconds=timeout_seconds,
+    )
+    return analyze_motion_sequence(samples=samples, preset=preset).to_dict()
 
 
 @mcp.tool()
@@ -289,12 +413,9 @@ def analyze_geometry_layout(
     height: int,
     layers: list[dict[str, object]],
     time_seconds: float = 0.0,
+    preset: LayoutPreset = "standard",
 ) -> dict[str, object]:
-    """Analyze 2D composition/layer geometry and return spatial conclusions without AE.
-
-    Each item in `layers` should contain: index, name, enabled (bool), isText (bool),
-    and bounds: {left, top, width, height}.
-    """
+    """Analyze 2D composition/layer geometry offline without After Effects."""
     comp = parse_composition_geometry(
         {
             "name": comp_name,
@@ -304,7 +425,8 @@ def analyze_geometry_layout(
             "layers": layers,
         }
     )
-    return _layout_analyzer.analyze(comp).to_dict()
+    analyzer = build_analyzer_for_preset(preset=preset, is_vertical_comp=comp.is_vertical)
+    return analyzer.analyze(comp).to_dict()
 
 
 def main() -> None:

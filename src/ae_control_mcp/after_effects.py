@@ -1,11 +1,10 @@
-"""Adobe After Effects 2020 automation via ExtendScript (.jsx) and aerender."""
+"""Adobe After Effects 2020 read-only inspection, ES3 script writing, cleanup, and aerender."""
 
 from __future__ import annotations
 
 import io
 import json
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -15,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image
+
+from .es3_linter import AE_ES3_STDLIB, lint_es3_script_detailed
 
 DEFAULT_AE_DIRS = [
     Path(r"C:\Program Files\Adobe\Adobe After Effects 2020\Support Files"),
@@ -182,15 +183,12 @@ def _read_result_when_ready(
                 raw = result_path.read_text(encoding="utf-8-sig")
                 return json.loads(raw)
             except (PermissionError, OSError, json.JSONDecodeError):
-                # On Windows, AE or AV may briefly hold the file lock right after writing.
                 time.sleep(0.1)
                 continue
         if proc is not None and exit_code is None:
             rc = proc.poll()
             if rc is not None:
                 exit_code = rc
-                # On Windows, AfterFX.exe -r hands off to the running AE instance and
-                # exits immediately with code 0 or 1 while AE is still running the script.
                 if rc not in (0, 1):
                     return {
                         "ok": False,
@@ -215,7 +213,7 @@ def _read_result_when_ready(
 
 
 def run_extendscript(script_code: str, timeout_seconds: float = 15.0) -> dict[str, Any]:
-    """Execute ExtendScript inside After Effects 2020 and return its JSON result."""
+    """Execute read-only ExtendScript inside After Effects 2020 and return its JSON result."""
     afterfx = find_ae_executable("AfterFX.exe")
 
     with tempfile.TemporaryDirectory(prefix="ae_mcp_", ignore_cleanup_errors=True) as tmp_dir:
@@ -225,10 +223,8 @@ def run_extendscript(script_code: str, timeout_seconds: float = 15.0) -> dict[st
         done_path = tmp_path / "result.done"
 
         wrapped = _wrap_extendscript(script_code, result_path, done_path)
-        # UTF-8 with BOM ensures After Effects 2020 on Windows decodes Cyrillic/Unicode properly.
         jsx_path.write_text(wrapped, encoding="utf-8-sig")
 
-        # AfterFX.exe -r sends the script to the running AE instance (or launches AE).
         proc = subprocess.Popen(
             [str(afterfx), "-r", str(jsx_path)],
             stdin=subprocess.DEVNULL,
@@ -285,6 +281,7 @@ def get_project_info(timeout_seconds: float = 15.0) -> dict[str, Any]:
             if (lyr instanceof AVLayer) {
                 try {
                     if (lyr.source && lyr.source.mainSource instanceof SolidSource) return "solid";
+                    if (lyr.source instanceof CompItem) return "precomp";
                 } catch (e) {}
                 return "av";
             }
@@ -343,135 +340,323 @@ def get_project_info(timeout_seconds: float = 15.0) -> dict[str, Any]:
     return run_extendscript(script, timeout_seconds=timeout_seconds)
 
 
-def create_composition(
-    name: str,
-    width: int = 1920,
-    height: int = 1080,
-    duration: float = 10.0,
-    frame_rate: float = 30.0,
-    bg_color: tuple[float, float, float] = (0.0, 0.0, 0.0),
-    pixel_aspect: float = 1.0,
-    timeout_seconds: float = 15.0,
-) -> dict[str, Any]:
-    """Create a new composition in After Effects and open it in the viewer."""
-    r, g, b = (max(0.0, min(1.0, float(c))) for c in bg_color)
-    script = f"""
-        if (!app.project) app.newProject();
-        app.beginUndoGroup("Create Composition");
-        try {{
-            var comp = app.project.items.addComp(
-                {_js_string(name)},
-                {int(width)},
-                {int(height)},
-                {float(pixel_aspect)},
-                {float(duration)},
-                {float(frame_rate)}
-            );
-            comp.bgColor = [{r}, {g}, {b}];
-            comp.openInViewer();
-            return {{
-                id: comp.id,
-                name: comp.name,
-                width: comp.width,
-                height: comp.height,
-                duration: comp.duration,
-                frameRate: comp.frameRate
-            }};
-        }} finally {{
-            app.endUndoGroup();
-        }}
-    """
-    return run_extendscript(script, timeout_seconds=timeout_seconds)
-
-
-def import_media(
-    file_path: str,
+def inspect_composition(
     comp_name: str | None = None,
-    add_to_comp: bool = True,
-    timeout_seconds: float = 20.0,
-) -> dict[str, Any]:
-    """Import an image, video, or audio file into the AE project (and optionally into a comp)."""
-    resolved = Path(file_path).expanduser().resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError(f"Media file not found: {resolved}")
-
-    add_block = ""
-    if add_to_comp:
-        add_block = f"""
-            {_comp_lookup_es3(comp_name)}
-            var addedLayer = comp.layers.add(footage);
-            layerInfo = {{
-                index: addedLayer.index,
-                name: addedLayer.name,
-                compName: comp.name
-            }};
-        """
-
-    script = f"""
-        if (!app.project) app.newProject();
-        app.beginUndoGroup("Import Media");
-        try {{
-            var f = new File({_js_string(str(resolved))});
-            if (!f.exists) throw new Error("File does not exist: " + f.fsName);
-            var io = new ImportOptions(f);
-            var footage = app.project.importFile(io);
-            var layerInfo = null;
-            {add_block}
-            return {{
-                itemId: footage.id,
-                itemName: footage.name,
-                width: footage.width || 0,
-                height: footage.height || 0,
-                duration: footage.duration || 0,
-                addedLayer: layerInfo
-            }};
-        }} finally {{
-            app.endUndoGroup();
-        }}
-    """
-    return run_extendscript(script, timeout_seconds=timeout_seconds)
-
-
-def save_project(
-    file_path: str | None = None,
+    layer_index: int | None = None,
+    layer_name: str | None = None,
+    time_seconds: float | None = None,
     timeout_seconds: float = 15.0,
 ) -> dict[str, Any]:
-    """Save the active After Effects project to disk (required before aerender)."""
-    if file_path:
-        target = Path(file_path).expanduser().resolve()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        save_stmt = f"""
-            var outFile = new File({_js_string(str(target))});
-            app.project.save(outFile);
-        """
-    else:
-        save_stmt = """
-            if (!app.project.file) {
-                throw new Error("Project has never been saved. Provide file_path (e.g. C:\\\\path\\\\project.aep).");
-            }
-            app.project.save();
-        """
+    """Read-only deep inspection of a composition's markers, layers, text styles, effects, and keyframes."""
+    idx_filter = "null" if layer_index is None else str(int(layer_index))
+    name_filter = _js_string(layer_name) if layer_name else "null"
+    target_time = "null" if time_seconds is None else str(float(time_seconds))
 
     script = f"""
-        if (!app.project) throw new Error("No open After Effects project.");
-        {save_stmt}
+        {_comp_lookup_es3(comp_name)}
+        var t = ({target_time} !== null) ? {target_time} : comp.time;
+        var filterIdx = {idx_filter};
+        var filterName = {name_filter};
+
+        function __propSnapshot(prop, sampleT) {{
+            if (!prop) return null;
+            var val = null;
+            try {{
+                val = prop.valueAtTime(sampleT, false);
+            }} catch (e) {{}}
+            var info = {{
+                value: val,
+                numKeys: prop.numKeys || 0
+            }};
+            if (prop.numKeys && prop.numKeys > 0) {{
+                info.firstKeyTime = prop.keyTime(1);
+                info.lastKeyTime = prop.keyTime(prop.numKeys);
+            }}
+            try {{
+                if (prop.canSetExpression && prop.expressionEnabled) {{
+                    info.expression = prop.expression;
+                    info.expressionError = prop.expressionError || "";
+                }}
+            }} catch (ee) {{}}
+            return info;
+        }}
+
+        function __readMarkers(markerProp) {{
+            var out = [];
+            if (!markerProp || !markerProp.numKeys) return out;
+            for (var m = 1; m <= markerProp.numKeys; m++) {{
+                try {{
+                    var mv = markerProp.keyValue(m);
+                    out.push({{
+                        time: markerProp.keyTime(m),
+                        comment: mv.comment || "",
+                        duration: mv.duration || 0,
+                        chapter: mv.chapter || ""
+                    }});
+                }} catch (me) {{}}
+            }}
+            return out;
+        }}
+
+        var compMarkers = [];
+        try {{
+            compMarkers = __readMarkers(comp.markerProperty);
+        }} catch (ce) {{}}
+
+        var layers = [];
+        for (var i = 1; i <= comp.numLayers; i++) {{
+            var lyr = comp.layer(i);
+            if (filterIdx !== null && lyr.index !== filterIdx) continue;
+            if (filterName !== null && lyr.name !== filterName) continue;
+
+            var ltype = "other";
+            if (lyr instanceof TextLayer) ltype = "text";
+            else if (lyr instanceof ShapeLayer) ltype = "shape";
+            else if (lyr instanceof CameraLayer) ltype = "camera";
+            else if (lyr instanceof LightLayer) ltype = "light";
+            else if (lyr.nullLayer) ltype = "null";
+            else if (lyr instanceof AVLayer) {{
+                try {{
+                    if (lyr.source instanceof CompItem) ltype = "precomp";
+                    else if (lyr.source && lyr.source.mainSource instanceof SolidSource) ltype = "solid";
+                    else ltype = "av";
+                }} catch (se) {{ ltype = "av"; }}
+            }}
+
+            var tr = lyr.transform;
+            var transformInfo = null;
+            if (tr) {{
+                transformInfo = {{
+                    anchorPoint: __propSnapshot(tr.anchorPoint, t),
+                    position: tr.position && tr.position.dimensionsSeparated
+                        ? {{
+                            separated: true,
+                            x: __propSnapshot(tr.property("ADBE Position_0"), t),
+                            y: __propSnapshot(tr.property("ADBE Position_1"), t)
+                        }}
+                        : __propSnapshot(tr.position, t),
+                    scale: __propSnapshot(tr.scale, t),
+                    rotation: __propSnapshot(tr.rotation || tr.zRotation, t),
+                    opacity: __propSnapshot(tr.opacity, t)
+                }};
+            }}
+
+            var textInfo = null;
+            if (lyr instanceof TextLayer) {{
+                try {{
+                    var srcText = lyr.property("Source Text");
+                    var td = srcText.valueAtTime(t, false);
+                    textInfo = {{
+                        text: td.text,
+                        font: td.font,
+                        fontSize: td.fontSize,
+                        applyFill: !!td.applyFill,
+                        fillColor: td.applyFill ? [td.fillColor[0], td.fillColor[1], td.fillColor[2]] : null,
+                        applyStroke: !!td.applyStroke,
+                        strokeColor: td.applyStroke ? [td.strokeColor[0], td.strokeColor[1], td.strokeColor[2]] : null,
+                        strokeWidth: td.applyStroke ? td.strokeWidth : 0,
+                        tracking: td.tracking,
+                        justification: String(td.justification),
+                        numKeys: srcText.numKeys || 0
+                    }};
+                }} catch (te) {{}}
+            }}
+
+            var effects = [];
+            try {{
+                var fxGroup = lyr.property("ADBE Effect Parade");
+                if (fxGroup) {{
+                    for (var f = 1; f <= fxGroup.numProperties; f++) {{
+                        var fx = fxGroup.property(f);
+                        effects.push({{
+                            index: f,
+                            name: fx.name,
+                            matchName: fx.matchName,
+                            enabled: !!fx.enabled
+                        }});
+                    }}
+                }}
+            }} catch (fe) {{}}
+
+            var sourceInfo = null;
+            try {{
+                if (lyr instanceof AVLayer && lyr.source) {{
+                    sourceInfo = {{
+                        id: lyr.source.id,
+                        name: lyr.source.name,
+                        isPrecomp: (lyr.source instanceof CompItem),
+                        footageMissing: (lyr.source instanceof FootageItem) ? !!lyr.source.footageMissing : false
+                    }};
+                }}
+            }} catch (srcErr) {{}}
+
+            layers.push({{
+                index: lyr.index,
+                name: lyr.name,
+                type: ltype,
+                enabled: !!lyr.enabled,
+                solo: !!lyr.solo,
+                locked: !!lyr.locked,
+                threeDLayer: !!lyr.threeDLayer,
+                parentIndex: lyr.parent ? lyr.parent.index : null,
+                parentName: lyr.parent ? lyr.parent.name : null,
+                inPoint: lyr.inPoint,
+                outPoint: lyr.outPoint,
+                startTime: lyr.startTime,
+                stretch: lyr.stretch,
+                transform: transformInfo,
+                text: textInfo,
+                effects: effects,
+                markers: __readMarkers(lyr.property("ADBE Marker")),
+                source: sourceInfo
+            }});
+        }}
+
         return {{
-            saved: true,
-            file: app.project.file ? app.project.file.fsName : null
+            compName: comp.name,
+            width: comp.width,
+            height: comp.height,
+            pixelAspect: comp.pixelAspect,
+            frameRate: comp.frameRate,
+            duration: comp.duration,
+            timeSeconds: t,
+            workAreaStart: comp.workAreaStart,
+            workAreaDuration: comp.workAreaDuration,
+            markers: compMarkers,
+            layers: layers
         }};
     """
     return run_extendscript(script, timeout_seconds=timeout_seconds)
 
 
-def save_frame_preview(
+def audit_project(timeout_seconds: float = 20.0) -> dict[str, Any]:
+    """Read-only health audit: missing footage, broken expressions, fonts used, unused items, and render templates."""
+    script = """
+        var proj = app.project;
+        if (!proj) return { hasProject: false };
+
+        var missingFootage = [];
+        var unusedFootage = [];
+        var expressionErrors = [];
+        var fontsMap = {};
+        var fontsUsed = [];
+        var compCount = 0;
+
+        function __scanProps(group, compName, lyrIndex, lyrName, depth) {
+            if (!group || depth > 4 || !group.numProperties) return;
+            for (var p = 1; p <= group.numProperties; p++) {
+                var pr = group.property(p);
+                if (!pr) continue;
+                try {
+                    if (pr.canSetExpression && pr.expressionEnabled && pr.expressionError && pr.expressionError !== "") {
+                        expressionErrors.push({
+                            compName: compName,
+                            layerIndex: lyrIndex,
+                            layerName: lyrName,
+                            propertyName: pr.name,
+                            matchName: pr.matchName,
+                            error: pr.expressionError
+                        });
+                    }
+                } catch (e) {}
+                if (pr.numProperties && pr.numProperties > 0) {
+                    __scanProps(pr, compName, lyrIndex, lyrName, depth + 1);
+                }
+            }
+        }
+
+        for (var i = 1; i <= proj.numItems; i++) {
+            var item = proj.item(i);
+            if (item instanceof FootageItem) {
+                var fPath = null;
+                try {
+                    if (item.file) fPath = item.file.fsName;
+                } catch (fe) {}
+                if (item.footageMissing) {
+                    missingFootage.push({
+                        id: item.id,
+                        name: item.name,
+                        missingPath: item.missingFootagePath || fPath
+                    });
+                }
+                var isSolid = false;
+                try {
+                    isSolid = (item.mainSource instanceof SolidSource);
+                } catch (se) {}
+                if (!isSolid && item.usedIn && item.usedIn.length === 0) {
+                    unusedFootage.push({ id: item.id, name: item.name, file: fPath });
+                }
+            } else if (item instanceof CompItem) {
+                compCount++;
+                for (var l = 1; l <= item.numLayers; l++) {
+                    var lyr = item.layer(l);
+                    if (lyr instanceof TextLayer) {
+                        try {
+                            var td = lyr.property("Source Text").value;
+                            if (td && td.font && !fontsMap[td.font]) {
+                                fontsMap[td.font] = true;
+                                fontsUsed.push(td.font);
+                            }
+                        } catch (te) {}
+                    }
+                    __scanProps(lyr, item.name, lyr.index, lyr.name, 1);
+                }
+            }
+        }
+
+        var renderTemplates = { renderSettings: [], outputModules: [] };
+        try {
+            if (proj.renderQueue && proj.renderQueue.numItems > 0) {
+                var rqItem = proj.renderQueue.item(1);
+                if (rqItem.templates) renderTemplates.renderSettings = rqItem.templates;
+                if (rqItem.numOutputModules > 0 && rqItem.outputModule(1).templates) {
+                    renderTemplates.outputModules = rqItem.outputModule(1).templates;
+                }
+            }
+        } catch (rqe) {}
+
+        return {
+            hasProject: true,
+            file: proj.file ? proj.file.fsName : null,
+            totalItems: proj.numItems,
+            compCount: compCount,
+            missingFootageCount: missingFootage.length,
+            expressionErrorCount: expressionErrors.length,
+            unusedFootageCount: unusedFootage.length,
+            missingFootage: missingFootage,
+            expressionErrors: expressionErrors,
+            unusedFootage: unusedFootage,
+            fontsUsed: fontsUsed,
+            renderTemplates: renderTemplates
+        };
+    """
+    return run_extendscript(script, timeout_seconds=timeout_seconds)
+
+
+def _wait_for_png_image(png_path: Path, deadline: float) -> Image.Image:
+    """Poll until After Effects finishes writing png_path asynchronously and return an RGB PIL Image."""
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        if png_path.is_file() and png_path.stat().st_size > 0:
+            try:
+                with Image.open(png_path) as img:
+                    img.load()
+                    return img.convert("RGB")
+            except (PermissionError, OSError) as exc:
+                last_err = exc
+        time.sleep(0.15)
+
+    detail = f" ({last_err})" if last_err else ""
+    raise RuntimeError(f"After Effects did not finish writing preview PNG '{png_path.name}'{detail}.")
+
+
+def render_raw_frame(
     comp_name: str | None = None,
     time_seconds: float | None = None,
-    max_dimension: int = 1280,
     timeout_seconds: float = 30.0,
-) -> FramePreviewResult:
-    """Render an exact frame of an AE composition to PNG via comp.saveFrameToPng."""
+) -> tuple[Image.Image, dict[str, Any]]:
+    """Render a single full-resolution RGB PIL Image and metadata dict via comp.saveFrameToPng."""
     target_time = "null" if time_seconds is None else str(float(time_seconds))
-
     with tempfile.TemporaryDirectory(prefix="ae_frame_", ignore_cleanup_errors=True) as tmp_dir:
         png_path = Path(tmp_dir) / "frame.png"
         script = f"""
@@ -496,47 +681,109 @@ def save_frame_preview(
         if not resp.get("ok"):
             raise RuntimeError(resp.get("error") or "Failed to render frame preview.")
 
-        # comp.saveFrameToPng() is asynchronous in After Effects 2020: wait until
-        # the PNG appears, is non-empty, and can be fully decoded by Pillow.
         deadline = time.monotonic() + timeout_seconds
-        rgb: Image.Image | None = None
-        last_err: Exception | None = None
-        while time.monotonic() < deadline:
-            if png_path.is_file() and png_path.stat().st_size > 0:
-                try:
-                    with Image.open(png_path) as img:
-                        img.load()
-                        rgb = img.convert("RGB")
-                    break
-                except (PermissionError, OSError) as exc:
-                    last_err = exc
-            time.sleep(0.15)
+        rgb = _wait_for_png_image(png_path, deadline)
+        meta = resp.get("result") or {}
+        return rgb, meta
 
-        if rgb is None:
-            detail = f" ({last_err})" if last_err else ""
-            raise RuntimeError(
-                f"After Effects did not finish writing preview PNG within {timeout_seconds}s{detail}."
-            )
+
+def save_frame_preview(
+    comp_name: str | None = None,
+    time_seconds: float | None = None,
+    max_dimension: int = 1280,
+    timeout_seconds: float = 30.0,
+) -> FramePreviewResult:
+    """Render an exact frame of an AE composition to JPEG bytes via comp.saveFrameToPng."""
+    rgb, meta = render_raw_frame(
+        comp_name=comp_name,
+        time_seconds=time_seconds,
+        timeout_seconds=timeout_seconds,
+    )
+    if max_dimension > 0 and max(rgb.width, rgb.height) > max_dimension:
+        ratio = max_dimension / float(max(rgb.width, rgb.height))
+        new_size = (
+            max(1, int(round(rgb.width * ratio))),
+            max(1, int(round(rgb.height * ratio))),
+        )
+        rgb = rgb.resize(new_size, Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    rgb.save(buf, format="JPEG", quality=88, optimize=True)
+    return FramePreviewResult(
+        image_bytes=buf.getvalue(),
+        mime_type="image/jpeg",
+        width=rgb.width,
+        height=rgb.height,
+        comp_name=str(meta.get("compName", comp_name or "")),
+        time_seconds=float(meta.get("timeSeconds", time_seconds or 0.0)),
+        frame_rate=float(meta.get("frameRate", 30.0)),
+    )
+
+
+def render_multiple_frames(
+    comp_name: str | None = None,
+    timestamps: list[float] | None = None,
+    num_frames: int = 6,
+    timeout_seconds: float = 45.0,
+) -> tuple[list[tuple[float, Image.Image]], dict[str, Any]]:
+    """Render multiple frames in a single ExtendScript round-trip for storyboard / contact sheets."""
+    count = max(2, min(16, int(num_frames)))
+    explicit_js = (
+        "[" + ", ".join(str(float(ts)) for ts in timestamps) + "]"
+        if timestamps
+        else "null"
+    )
+
+    with tempfile.TemporaryDirectory(prefix="ae_frame_", ignore_cleanup_errors=True) as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        out_dir_js = _js_string(str(tmp_path))
+        script = f"""
+            {_comp_lookup_es3(comp_name)}
+            var outDir = {out_dir_js};
+            var explicitTimes = {explicit_js};
+            var times = [];
+            var maxT = Math.max(0, comp.duration - comp.frameDuration);
+            if (explicitTimes !== null && explicitTimes.length > 0) {{
+                for (var e = 0; e < explicitTimes.length; e++) {{
+                    times.push(Math.min(maxT, Math.max(0, explicitTimes[e])));
+                }}
+            }} else {{
+                var startT = comp.workAreaStart;
+                var durT = comp.workAreaDuration;
+                var n = {count};
+                for (var s = 0; s < n; s++) {{
+                    var ratio = (n === 1) ? 0.0 : (s / (n - 1));
+                    times.push(Math.min(maxT, Math.max(0, startT + durT * ratio)));
+                }}
+            }}
+            var files = [];
+            for (var i = 0; i < times.length; i++) {{
+                var fname = "frame_" + i + ".png";
+                var f = new File(outDir + "/" + fname);
+                comp.saveFrameToPng(times[i], f);
+                files.push({{ index: i, timeSeconds: times[i], fileName: fname }});
+            }}
+            return {{
+                compName: comp.name,
+                frameRate: comp.frameRate,
+                width: comp.width,
+                height: comp.height,
+                frames: files
+            }};
+        """
+        resp = run_extendscript(script, timeout_seconds=timeout_seconds)
+        if not resp.get("ok"):
+            raise RuntimeError(resp.get("error") or "Failed to render storyboard frames.")
 
         meta = resp.get("result") or {}
-        if max_dimension > 0 and max(rgb.width, rgb.height) > max_dimension:
-            ratio = max_dimension / float(max(rgb.width, rgb.height))
-            new_size = (
-                max(1, int(round(rgb.width * ratio))),
-                max(1, int(round(rgb.height * ratio))),
-            )
-            rgb = rgb.resize(new_size, Image.Resampling.LANCZOS)
-        buf = io.BytesIO()
-        rgb.save(buf, format="JPEG", quality=88, optimize=True)
-        return FramePreviewResult(
-            image_bytes=buf.getvalue(),
-            mime_type="image/jpeg",
-            width=rgb.width,
-            height=rgb.height,
-            comp_name=str(meta.get("compName", comp_name or "")),
-            time_seconds=float(meta.get("timeSeconds", time_seconds or 0.0)),
-            frame_rate=float(meta.get("frameRate", 30.0)),
-        )
+        frame_specs = meta.get("frames") or []
+        deadline = time.monotonic() + timeout_seconds
+        rendered: list[tuple[float, Image.Image]] = []
+        for spec in frame_specs:
+            png_path = tmp_path / str(spec["fileName"])
+            img = _wait_for_png_image(png_path, deadline)
+            rendered.append((float(spec["timeSeconds"]), img))
+
+        return rendered, meta
 
 
 def render_composition(
@@ -614,6 +861,8 @@ _JUNK_IMAGE_MARKERS = (
     "ae_frame",
     "ae_preview",
     "frame_preview",
+    "contact_sheet",
+    "annotated_",
     "debug_",
     "tmp_",
     "temp_",
@@ -624,19 +873,8 @@ _JUNK_EXACT_NAMES = frozenset({"result.json", "result.done"})
 
 
 def _lint_es3_script(script_code: str) -> list[str]:
-    """Return non-fatal ES3 / safety warnings for an After Effects 2020 .jsx script."""
-    warnings: list[str] = []
-    if re.search(r"\b(?:let|const)\s+[A-Za-z_$]", script_code):
-        warnings.append("Detected 'let'/'const' (ES6+); AE 2020 ExtendScript requires 'var'.")
-    if "=>" in script_code:
-        warnings.append("Detected arrow function '=>' (ES6+); AE 2020 requires 'function (...) {}'.")
-    if "`" in script_code:
-        warnings.append("Detected template literal backtick '`' (ES6+); use string concatenation '+'.")
-    if "JSON.stringify" in script_code or "JSON.parse" in script_code:
-        warnings.append("Detected 'JSON.stringify'/'JSON.parse', which do not exist in AE 2020 ES3.")
-    if re.search(r"app\.project\.save\s*\(", script_code):
-        warnings.append("Detected 'app.project.save()'; scripts should not auto-save the user's .aep project.")
-    return warnings
+    """Return formatted ES3 / safety warning strings with line numbers."""
+    return [issue.format_warning() for issue in lint_es3_script_detailed(script_code)]
 
 
 def write_extendscript_file(
@@ -644,6 +882,8 @@ def write_extendscript_file(
     script_code: str,
     undo_group_name: str | None = None,
     overwrite: bool = True,
+    include_stdlib: bool = False,
+    strict: bool = False,
 ) -> dict[str, Any]:
     """Write an ES3 ExtendScript (.jsx) file in UTF-8 with BOM without running or saving AE."""
     target = Path(output_path).expanduser().resolve()
@@ -654,9 +894,12 @@ def write_extendscript_file(
         raise FileExistsError(f"Script file already exists and overwrite=False: {target}")
 
     body = script_code.strip()
+    stdlib_block = (AE_ES3_STDLIB.strip() + "\n\n") if include_stdlib else ""
+
     if undo_group_name and "beginUndoGroup" not in body:
         escaped_group = _js_string(undo_group_name)
-        indented = "\n".join(f"        {line}" if line.strip() else "" for line in body.splitlines())
+        combined = stdlib_block + body
+        indented = "\n".join(f"        {line}" if line.strip() else "" for line in combined.splitlines())
         final_code = (
             "(function () {\n"
             f"    app.beginUndoGroup({escaped_group});\n"
@@ -670,19 +913,36 @@ def write_extendscript_file(
             "})();\n"
         )
     else:
-        final_code = body + "\n"
+        final_code = stdlib_block + body + "\n"
 
-    warnings = _lint_es3_script(final_code)
+    issues = lint_es3_script_detailed(final_code)
+    warnings = [item.format_warning() for item in issues]
+    has_errors = any(item.severity == "error" for item in issues)
+
+    if strict and has_errors:
+        return {
+            "ok": False,
+            "written": False,
+            "path": str(target),
+            "bytes_written": 0,
+            "wrapped_in_undo_group": bool(undo_group_name and "beginUndoGroup" not in body),
+            "included_stdlib": include_stdlib,
+            "warnings": warnings,
+            "issues": [item.to_dict() for item in issues],
+        }
+
     target.parent.mkdir(parents=True, exist_ok=True)
-    # UTF-8 with BOM ensures After Effects 2020 on Windows decodes Cyrillic/Unicode properly.
     target.write_text(final_code, encoding="utf-8-sig")
 
     return {
         "ok": True,
+        "written": True,
         "path": str(target),
         "bytes_written": target.stat().st_size,
         "wrapped_in_undo_group": bool(undo_group_name and "beginUndoGroup" not in body),
+        "included_stdlib": include_stdlib,
         "warnings": warnings,
+        "issues": [item.to_dict() for item in issues],
     }
 
 
@@ -753,7 +1013,6 @@ def cleanup_artifacts(
     def _remove_dir(p: Path, allow_temp_dir: bool = False) -> None:
         nonlocal freed_bytes
         if not allow_temp_dir:
-            # Never delete a user directory that contains protected scripts/projects.
             for child in p.rglob("*"):
                 if child.is_file() and _is_protected_file(child):
                     skipped_protected.append(str(child))
@@ -803,6 +1062,6 @@ def cleanup_artifacts(
         "deleted_files": deleted_files,
         "deleted_dirs": deleted_dirs,
         "skipped_protected": skipped_protected,
-        "errors": errors,
         "freed_bytes": freed_bytes,
+        "errors": errors,
     }

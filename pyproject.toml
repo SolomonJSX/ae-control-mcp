@@ -1,6 +1,6 @@
 [project]
 name = "ae-control-mcp"
-version = "0.1.0"
+version = "0.4.0"
 description = "MCP server for GUI mouse/keyboard control and Adobe After Effects 2020 automation"
 requires-python = ">=3.11"
 dependencies = [

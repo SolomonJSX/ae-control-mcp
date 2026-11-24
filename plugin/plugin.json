@@ -1,11 +1,12 @@
 {
   "name": "ae-control",
   "displayName": "After Effects & GUI Control",
-  "version": "0.3.0",
-  "description": "Inspect Adobe After Effects 2020 projects read-only, generate safe ES3 .jsx ExtendScript files for manual execution, clean up temporary screenshots/artifacts, and render via aerender.",
+  "version": "0.4.0",
+  "logo": "assets/logo.svg",
+  "description": "Read-only Adobe After Effects 2020 project & layer inspector, parent-aware spatial/motion layout analyzer, visual contact-sheet previewer, safe ES3 .jsx generator with AEH stdlib, and DPI-aware GUI control.",
   "suggestedPrompts": [
-    "Inspect the active Adobe After Effects project and analyze its current frame layout",
-    "Write a safe ES3 .jsx script for After Effects 2020 to animate this scene without modifying or saving my .aep project",
-    "Clean up old screenshots, frame previews, and temporary files while keeping all .jsx scripts"
+    "Audit my open After Effects project for broken expressions, missing footage, and layout issues",
+    "Render an annotated preview and storyboard contact sheet of the active composition",
+    "Write a safe ES3 .jsx script using AEH helpers to animate this scene without saving my .aep"
   ]
 }

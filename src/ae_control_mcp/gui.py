@@ -269,8 +269,16 @@ def drag_mouse(
     return int(pos.x), int(pos.y)
 
 
-def scroll_mouse(clicks: int, x: int | None = None, y: int | None = None) -> None:
+def scroll_mouse(
+    clicks: int,
+    x: int | None = None,
+    y: int | None = None,
+    target_window: str | None = None,
+) -> None:
     """Scroll vertically (positive = up, negative = down)."""
+    if target_window:
+        check_x, check_y = (x, y) if (x is not None and y is not None) else pyautogui.position()
+        _ensure_within_window(int(check_x), int(check_y), target_window)
     if x is not None and y is not None:
         pyautogui.scroll(clicks, x=x, y=y)
     else:
@@ -361,13 +369,73 @@ def type_text(text: str, interval: float = 0.01) -> None:
     raise RuntimeError("Failed to type non-ASCII text via Windows clipboard.")
 
 
-def press_hotkey(keys: list[str]) -> None:
-    """Press a key combination, e.g. ['ctrl', 's'] or ['space']."""
+_BLOCKED_AE_HOTKEYS: tuple[frozenset[str], ...] = (
+    frozenset({"ctrl", "s"}),
+    frozenset({"ctrl", "shift", "s"}),
+    frozenset({"ctrl", "alt", "s"}),
+    frozenset({"ctrl", "w"}),
+    frozenset({"ctrl", "q"}),
+    frozenset({"alt", "f4"}),
+)
+
+_KEY_ALIASES: dict[str, str] = {
+    "control": "ctrl",
+    "ctrlleft": "ctrl",
+    "ctrlright": "ctrl",
+    "shiftleft": "shift",
+    "shiftright": "shift",
+    "altleft": "alt",
+    "altright": "alt",
+}
+
+
+def _active_window_title() -> str:
+    """Return the title of the currently active desktop window, or empty string."""
+    try:
+        active = gw.getActiveWindow()
+        return str(active.title) if active and active.title else ""
+    except Exception:
+        return ""
+
+
+def _normalize_key_set(keys: list[str]) -> frozenset[str]:
+    normalized: set[str] = set()
+    for key in keys:
+        low = key.strip().lower()
+        normalized.add(_KEY_ALIASES.get(low, low))
+    return frozenset(normalized)
+
+
+def press_hotkey(keys: list[str], target_window: str | None = None) -> None:
+    """Press a key combination while blocking project-save/close shortcuts in After Effects."""
     if not keys:
         raise ValueError("keys must be a non-empty list.")
     cleaned = [k.strip() for k in keys if k and k.strip()]
     if not cleaned:
         raise ValueError("keys must contain at least one non-empty key name.")
+
+    active_title = _active_window_title()
+    if target_window:
+        win = _find_window(target_window)
+        if win is None:
+            raise ValueError(f"Target window '{target_window}' was not found.")
+        if win.isMinimized:
+            raise ValueError(f"Target window '{win.title}' is minimized.")
+        if target_window.lower().strip() not in active_title.lower():
+            focus_window(target_window)
+            active_title = win.title
+
+    ae_context = "after effects" in active_title.lower() or (
+        target_window is not None and "after effects" in target_window.lower()
+    )
+    key_set = _normalize_key_set(cleaned)
+    if ae_context and key_set in _BLOCKED_AE_HOTKEYS:
+        combo = "+".join(cleaned)
+        raise PermissionError(
+            f"Blocked hotkey '{combo}' in After Effects: direct project saving or closing "
+            "is prohibited by safety policy."
+        )
+
     if len(cleaned) == 1:
         pyautogui.press(cleaned[0])
     else:

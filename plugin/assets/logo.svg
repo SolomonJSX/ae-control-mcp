@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E1B4B"/>
+      <stop offset="100%" stop-color="#311042"/>
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#C084FC"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
+  </defs>
+  <!-- 11% margin around 200x200 badge -->
+  <rect x="28" y="28" width="200" height="200" rx="42" fill="url(#bgGrad)" stroke="#A78BFA" stroke-width="6"/>
+  <!-- Stylized Ae Monogram -->
+  <text x="58" y="146" font-family="Segoe UI, Arial, sans-serif" font-size="82" font-weight="800" fill="#DDD6FE" letter-spacing="-2">Ae</text>
+  <!-- Keyframe diamond + timeline bar -->
+  <line x1="58" y1="184" x2="198" y2="184" stroke="url(#accentGrad)" stroke-width="6" stroke-linecap="round"/>
+  <polygon points="168,168 184,184 168,200 152,184" fill="#38BDF8" stroke="#1E1B4B" stroke-width="3"/>
+  <!-- JSX script angle badge -->
+  <path d="M174 70 L192 84 L174 98" fill="none" stroke="#38BDF8" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

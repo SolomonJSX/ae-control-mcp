@@ -1,4 +1,4 @@
-"""Unit tests for GUI safety guards, hotkeys, and screenshot metadata."""
+"""Unit tests for GUI safety guards, After Effects hotkey blocking, and screenshot metadata."""
 
 from __future__ import annotations
 
@@ -24,6 +24,24 @@ class TestGuiHelpers(unittest.TestCase):
             with self.assertRaises(ValueError):
                 gui._ensure_within_window(50, 400, "After Effects")
 
+    def test_scroll_mouse_enforces_target_window(self) -> None:
+        fake_win = SimpleNamespace(
+            title="Adobe After Effects 2020",
+            left=100,
+            top=100,
+            width=800,
+            height=600,
+            isMinimized=False,
+        )
+        with (
+            mock.patch.object(gui, "_find_window", return_value=fake_win),
+            mock.patch("pyautogui.scroll") as scroll_mock,
+        ):
+            gui.scroll_mouse(-3, x=300, y=300, target_window="After Effects")
+            scroll_mock.assert_called_once_with(-3, x=300, y=300)
+            with self.assertRaises(ValueError):
+                gui.scroll_mouse(-3, x=20, y=20, target_window="After Effects")
+
     def test_capture_screenshot_rejects_minimized_window(self) -> None:
         fake_win = SimpleNamespace(
             title="Adobe After Effects 2020",
@@ -43,6 +61,21 @@ class TestGuiHelpers(unittest.TestCase):
             gui.press_hotkey([])
         with self.assertRaises(ValueError):
             gui.press_hotkey(["   "])
+
+    def test_press_hotkey_blocks_save_and_close_in_after_effects_but_allows_undo(self) -> None:
+        with (
+            mock.patch.object(gui, "_active_window_title", return_value="Adobe After Effects 2020 - untitled.aep"),
+            mock.patch("pyautogui.hotkey") as hotkey_mock,
+        ):
+            with self.assertRaises(PermissionError):
+                gui.press_hotkey(["ctrl", "s"])
+            with self.assertRaises(PermissionError):
+                gui.press_hotkey(["control", "shift", "S"])
+            with self.assertRaises(PermissionError):
+                gui.press_hotkey(["alt", "f4"])
+
+            gui.press_hotkey(["ctrl", "z"])
+            hotkey_mock.assert_called_once_with("ctrl", "z")
 
     def test_type_text_uses_pyautogui_for_ascii(self) -> None:
         with mock.patch("pyautogui.write") as write_mock:

@@ -67,6 +67,8 @@ class LayerGeometry:
     rotation_deg: float
     is_text: bool = False
     is_three_d: bool = False
+    parent_index: int | None = None
+    text_color: tuple[float, float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,10 @@ class CompositionGeometry:
     @property
     def frame_rect(self) -> Rect:
         return Rect(left=0.0, top=0.0, width=float(self.width), height=float(self.height))
+
+    @property
+    def is_vertical(self) -> bool:
+        return self.height > self.width
 
     def safe_rect(self, margin_ratio: float) -> Rect:
         """Return an inset rectangle (e.g. 0.10 margin_ratio -> 80% title-safe)."""
@@ -112,6 +118,31 @@ class LayoutReport:
     time_seconds: float
     layer_count: int
     findings: tuple[SpatialFinding, ...]
+    summary: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class MotionFindingInterval:
+    rule: str
+    severity: str
+    code: str
+    layers: tuple[str, ...]
+    first_time: float
+    last_time: float
+    sample_count: int
+    message: str
+
+
+@dataclass(frozen=True)
+class MotionLayoutReport:
+    composition_name: str
+    width: int
+    height: int
+    sampled_times: tuple[float, ...]
+    intervals: tuple[MotionFindingInterval, ...]
     summary: str
 
     def to_dict(self) -> dict[str, Any]:
